@@ -1,0 +1,6 @@
+body { background: #f5f7fa; color: #182230; }
+.card { border: 1px solid #e1e7ef; border-radius: .7rem; }
+.metric-card { height: 100%; }
+.auth-card { max-width: 440px; margin: 4rem auto; }
+.table th { white-space: nowrap; color: #526173; font-weight: 600; }
+code { font-size: .75rem; overflow-wrap: anywhere; }
