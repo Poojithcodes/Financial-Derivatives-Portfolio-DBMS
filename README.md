@@ -32,6 +32,46 @@ A local portfolio and settlement ledger for options and derivatives. Operational
 
    Visit <http://127.0.0.1:5000>. Use `/health` to check database connectivity. The health endpoint requires both databases.
 
+## Configure Kite Connect login
+
+Kite authentication is implemented as a server-side login flow. In the Zerodha Kite Connect developer console, create/open your app and set its **Redirect URL** to exactly:
+
+```text
+http://127.0.0.1:5000/kite/callback
+```
+
+Add the API key and secret issued for that app to `.env`. Generate a Fernet key for encrypting access tokens at rest:
+
+```powershell
+py -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Set the resulting values in `.env`:
+
+```dotenv
+KITE_API_KEY=your_api_key
+KITE_API_SECRET=your_api_secret
+KITE_TOKEN_ENCRYPTION_KEY=your_generated_fernet_key
+KITE_REDIRECT_URL=http://127.0.0.1:5000/kite/callback
+```
+
+Keep the API secret and encryption key private. Back up the encryption key securely; losing it prevents decryption of stored access tokens. Restart Flask, open the app at <http://127.0.0.1:5000> (use this exact host), sign in, open **Kite Connect**, and select **Connect to Kite**. Zerodha redirects to the callback, where the server exchanges the one-time request token and stores the encrypted access token. Kite access tokens expire daily, so reconnect when needed.
+
+For an existing database created before Kite support, run the migration once in PowerShell:
+
+```powershell
+docker compose exec mysql mysql -u root -p derivative_ledger
+```
+
+Enter the MySQL root password from `.env`, then at the `mysql>` prompt run:
+
+```sql
+SOURCE /docker-entrypoint-initdb.d/002-kite-sessions.sql;
+EXIT;
+```
+
+The callback URL is for local development. For a deployed app, use its public HTTPS URL, set that same exact value as `KITE_REDIRECT_URL`, register it with Zerodha, and serve the callback over HTTPS.
+
 `docker compose down` stops the database containers. Named volumes preserve their data. To delete local database data, run `docker compose down -v` only when you intend to remove both database volumes.
 
 ## Feature checklist
@@ -47,6 +87,7 @@ A local portfolio and settlement ledger for options and derivatives. Operational
 - [x] Scenario records with live versus projected P&L, premium exposure, and short-margin estimates.
 - [x] Split, reverse-split, and bonus adjustments to contracts, open position basis, and FIFO lots, with before/after records.
 - [x] Session form tokens for POST requests.
+- [x] Kite Connect login redirect, request-token exchange, callback-state validation, encrypted access-token storage, and disconnect/revoke.
 - [ ] Automated background retry worker and concurrency-safe audit chain appender for multi-user deployment.
 - [ ] Password reset, account recovery, and production deployment hardening.
 

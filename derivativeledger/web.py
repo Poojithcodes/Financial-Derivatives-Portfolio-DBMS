@@ -1,13 +1,112 @@
 from decimal import Decimal
 import json
+import hmac
+import secrets
+import time
+from urllib.parse import urlencode, urlsplit
 from functools import wraps
-from flask import Blueprint, flash, redirect, render_template, request, session, url_for
+from flask import Blueprint, current_app, flash, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 from .db import query, execute, mysql_connection
 from .security import login_required, roles_required
 from .services import execute_trade, record_settlement, flush_audit_outbox, verify_audit_chain, calculate_margin
+from .kite import KiteConfigurationError, configured_client, api_secret, encrypt_access_token, decrypt_access_token
 
 bp = Blueprint("web", __name__)
+
+
+def _sensitive_redirect(endpoint):
+    response = redirect(url_for(endpoint))
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+@bp.get("/kite")
+@login_required
+def kite_settings():
+    connection = query("SELECT kite_user_id,kite_user_name,connected_at FROM kite_sessions WHERE user_id=%s", (session["user_id"],), one=True)
+    redirect_url = current_app.config.get("KITE_REDIRECT_URL", "")
+    required_settings = ("KITE_API_KEY", "KITE_API_SECRET", "KITE_TOKEN_ENCRYPTION_KEY")
+    missing_settings = [key for key in required_settings if not current_app.config.get(key)]
+    return render_template("kite.html", connection=connection, redirect_url=redirect_url,
+                           credentials_ready=not missing_settings, missing_settings=missing_settings)
+
+
+@bp.get("/kite/connect")
+@roles_required("TRADER", "ADMINISTRATOR")
+def kite_connect():
+    try:
+        configured_client()
+        api_secret()
+        encrypt_access_token("configuration-check")
+    except KiteConfigurationError as exc:
+        flash(str(exc), "danger")
+        return redirect(url_for("web.kite_settings"))
+    registered_url = current_app.config.get("KITE_REDIRECT_URL", "").rstrip("/")
+    actual_url = url_for("web.kite_callback", _external=True).rstrip("/")
+    parsed = urlsplit(registered_url)
+    if not parsed.scheme in {"http", "https"} or not parsed.netloc or parsed.path != "/kite/callback":
+        flash("Set KITE_REDIRECT_URL to the full /kite/callback URL in .env.", "danger")
+        return redirect(url_for("web.kite_settings"))
+    if parsed.hostname in {"localhost", "127.0.0.1"} and registered_url != actual_url:
+        flash(f"Open the app at the same host used in KITE_REDIRECT_URL. Current app callback is {actual_url}.", "danger")
+        return redirect(url_for("web.kite_settings"))
+    state = secrets.token_urlsafe(32)
+    session["kite_oauth_state"] = state
+    session["kite_oauth_started"] = int(time.time())
+    login_url = configured_client().login_url()
+    separator = "&" if "?" in login_url else "?"
+    login_url += separator + urlencode({"redirect_params": urlencode({"state": state})})
+    response = redirect(login_url)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+@bp.get("/kite/callback")
+def kite_callback():
+    expected_state = session.pop("kite_oauth_state", "")
+    started = session.pop("kite_oauth_started", 0)
+    received_state = request.args.get("state", "")
+    if not session.get("user_id") or not expected_state or not received_state or not hmac.compare_digest(expected_state, received_state) or time.time() - started > 600:
+        flash("Kite login expired or could not be verified. Start the connection again.", "danger")
+        return _sensitive_redirect("web.kite_settings") if session.get("user_id") else _sensitive_redirect("web.login")
+    if request.args.get("status") != "success" or not request.args.get("request_token"):
+        flash("Kite authorization did not complete. Try connecting again.", "warning")
+        return _sensitive_redirect("web.kite_settings")
+    try:
+        kite = configured_client()
+        token_data = kite.generate_session(request.args["request_token"], api_secret=api_secret())
+        access_token = token_data.get("access_token")
+        kite_user_id = token_data.get("user_id")
+        kite_user_name = token_data.get("user_name") or kite_user_id
+        if not access_token or not kite_user_id:
+            raise KiteConfigurationError("Kite did not return the required account and access token details.")
+        encrypted = encrypt_access_token(access_token)
+        execute("INSERT INTO kite_sessions (user_id,kite_user_id,kite_user_name,access_token_ciphertext,connected_at) VALUES (%s,%s,%s,%s,UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE kite_user_id=VALUES(kite_user_id),kite_user_name=VALUES(kite_user_name),access_token_ciphertext=VALUES(access_token_ciphertext),connected_at=UTC_TIMESTAMP()",
+                (session["user_id"], kite_user_id, kite_user_name, encrypted))
+        flash(f"Kite Connect is linked to {kite_user_name} ({kite_user_id}).", "success")
+    except Exception:
+        current_app.logger.warning("Kite callback token exchange failed for application user %s", session["user_id"])
+        flash("Kite token exchange failed. Check the API key, API secret, registered redirect URL, and Kite app access.", "danger")
+    return _sensitive_redirect("web.kite_settings")
+
+
+@bp.post("/kite/disconnect")
+@roles_required("TRADER", "ADMINISTRATOR")
+def kite_disconnect():
+    stored = query("SELECT access_token_ciphertext FROM kite_sessions WHERE user_id=%s", (session["user_id"],), one=True)
+    if stored:
+        try:
+            token = decrypt_access_token(stored["access_token_ciphertext"])
+            configured_client().invalidate_access_token(token)
+        except Exception:
+            current_app.logger.info("Kite token revoke was unavailable for application user %s", session["user_id"])
+        execute("DELETE FROM kite_sessions WHERE user_id=%s", (session["user_id"],))
+    flash("Kite connection removed from this application.", "success")
+    return redirect(url_for("web.kite_settings"))
 
 
 def owned_account(account_id):
